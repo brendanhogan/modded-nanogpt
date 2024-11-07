@@ -93,7 +93,21 @@ class Muon(torch.optim.Optimizer):
             curr_idx = 0
             for i, p in enumerate(group['params']):
                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                if running_distributed:
+                    if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                        g = p.grad
+                        assert g is not None
+                        state = self.state[p]
+                        if 'momentum_buffer' not in state:
+                            state['momentum_buffer'] = torch.zeros_like(g)
+                        buf = state['momentum_buffer']
+                        buf.mul_(momentum).add_(g)
+                        if group['nesterov']:
+                            g = g.add(buf, alpha=momentum)
+                        g = zeropower_backend(g, steps=group['backend_steps'])
+                        g *= max(1, g.size(0)/g.size(1))**0.5
+                        updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                else: 
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -105,11 +119,12 @@ class Muon(torch.optim.Optimizer):
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_backend(g, steps=group['backend_steps'])
                     g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()         
                 curr_idx += p.numel()
 
             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            if running_distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             # deserialize and apply updates
             curr_idx = 0
@@ -361,16 +376,29 @@ class Hyperparameters:
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
-# set up DDP (distributed data parallel). torchrun sets this env variable
+
 assert torch.cuda.is_available()
-dist.init_process_group(backend='nccl')
-ddp_rank = int(os.environ['RANK'])
-ddp_local_rank = int(os.environ['LOCAL_RANK'])
-ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
-torch.cuda.set_device(device)
+
+### Change - want to allow single GPU runs 
+running_distributed = int(os.environ.get('RANK', -1)) != -1
+if running_distributed:
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+else: 
+    print("running on single GPU")
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True    
+    device = 'cuda'
 print(f"using device: {device}")
-master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -398,8 +426,11 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
+if running_distributed:
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module # always contains the "raw" unwrapped model
+else: 
+    raw_model = model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
@@ -484,7 +515,8 @@ for step in range(args.num_iterations + 1):
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
                 del loss
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        if running_distributed:
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
@@ -523,7 +555,7 @@ for step in range(args.num_iterations + 1):
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
-        if i < train_accumulation_steps:
+        if i < train_accumulation_steps and running_distributed:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
@@ -554,4 +586,5 @@ if master_process:
 
 # -------------------------------------------------------------------------
 # clean up nice
-dist.destroy_process_group()
+if running_distributed:
+    dist.destroy_process_group()
