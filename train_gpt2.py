@@ -246,38 +246,60 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+
+        self.num_layers = config.n_layer
+        self.encoder_layers = self.num_layers // 2  # Half of the layers for encoder
+        self.decoder_layers = self.num_layers - self.encoder_layers  # Remaining for decoder
+        
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, targets=None, return_logits=True):
-
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),))  # @Grad62304977
         x0 = x
         v1 = None
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
+        
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.encoder_layers):
+            x, v1 = self.transformer.h[i](x, v1, x0)
+            skip_connections.append(x)  # Store the output for skip connections
+        
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.decoder_layers):
+            skip_connection = skip_connections.pop()  # Get the corresponding encoder output
+            # Apply learnable weight to skip connection
+            weighted_skip = self.skip_weights[i] * skip_connection
+            x, v1 = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0)
+        
         x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # Calculate loss if targets are provided
             logits = self.lm_head(x)
-            logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-            logits = logits.float() # use tf32/fp32 for logits
+            logits = 30 * torch.tanh(logits / 30)  # @Grad62304977
+            logits = logits.float()  # Use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = 30 * torch.tanh(logits / 30) # @Grad62304977
-            logits = logits.float() # use tf32/fp32 for logits
+            # Inference-time optimization: only forward the lm_head on the last position
+            logits = self.lm_head(x[:, [-1], :])  # Use list [-1] to preserve time dim
+            logits = 30 * torch.tanh(logits / 30)  # @Grad62304977
+            logits = logits.float()  # Use tf32/fp32 for logits
             loss = None
 
-        # there are performance reasons why not returning logits is prudent, if not needed
+        # Returning logits is optional based on return_logits
         if not return_logits:
             logits = None
 
         return logits, loss
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -366,15 +388,17 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3200 # number of iterations to run
+    num_iterations : int = 2800 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 914 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
+
+
 
 
 assert torch.cuda.is_available()
@@ -415,6 +439,27 @@ val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+
+## dynamic batch size 
+initial_batch_size = args.device_batch_size // 4  # Starting batch size (e.g., quarter of the final batch size)
+warmup_steps = 500  # Number of steps over which to linearly increase the batch size
+final_batch_size = args.device_batch_size
+def adjust_batch_size(step):
+    if step < warmup_steps:
+        # Step through batch sizes 2,4,8,16,32,64
+        step_sizes = [2, 4, 8, 16, 32, 64]
+        step_interval = warmup_steps / len(step_sizes)
+        current_step_idx = int(step / step_interval)
+        current_batch_size = step_sizes[min(current_step_idx, len(step_sizes)-1)]
+        train_loader.B = current_batch_size
+        print(f"Warmup step {step}: Batch size adjusted to {current_batch_size}")
+    else: 
+        train_loader.B = final_batch_size
+        print(f"Warmup step {step}: Batch size adjusted to {final_batch_size}")
+
+# adjust_batch_size(0)
+
+
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -441,13 +486,13 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params,           lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params,           lr=0.04,  momentum=0.95)
+optimizer4 = torch.optim.Adam(list(scalar_params) + [raw_model.skip_weights], lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
@@ -571,6 +616,8 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+
+    # adjust_batch_size(step)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -583,8 +630,3 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-# -------------------------------------------------------------------------
-# clean up nice
-if running_distributed:
-    dist.destroy_process_group()
