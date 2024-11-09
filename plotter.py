@@ -83,7 +83,7 @@ if __name__ == "__main__":
         # Add more log files here
     ]
     labels = [
-        "Previous Record",
+        "Previous Record (110824_CastBf16)",
         "Attention UNet"
     ]
     create_plots(log_files, labels)
