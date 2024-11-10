@@ -79,7 +79,7 @@ if __name__ == "__main__":
     # Example usage
     log_files = [
         "records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt",
-        "records/110924_Unet/b096c044-a704-4779-9ada-290bdac74191.txt"
+        "records/110924_Unet/27268236-081c-4073-84a6-23a65d24e770.txt"
         # Add more log files here
     ]
     labels = [
